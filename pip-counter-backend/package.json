@@ -1,0 +1,20 @@
+{
+  "name": "pip-counter-backend",
+  "version": "1.0.0",
+  "description": "Industrial pipe counter API with solid and hollow model streams.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "cors": "^2.8.6",
+    "express": "^5.2.1",
+    "multer": "^2.1.1",
+    "onnxruntime-node": "^1.26.0",
+    "sharp": "^0.34.5"
+  }
+}
