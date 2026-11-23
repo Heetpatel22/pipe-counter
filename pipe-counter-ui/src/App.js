@@ -43,6 +43,8 @@ function App() {
   const [iou, setIou] = useState(0.45);
   const [imageSize, setImageSize] = useState(640);
   const [glareFilter, setGlareFilter] = useState(false);
+  const [enableGemini, setEnableGemini] = useState(false);
+  const [geminiLoading, setGeminiLoading] = useState(false);
   const [result, setResult] = useState(null);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
@@ -121,19 +123,25 @@ function App() {
   }, [sampleFilter]);
 
   const handleDetect = async () => {
-    if (!file) return;
+    if (!file && !selectedSampleId) return;
 
     setLoading(true);
     setError("");
     setResult(null);
 
     const formData = new FormData();
-    formData.append("image", file);
+    if (file) {
+      formData.append("image", file);
+    }
+    if (selectedSampleId) {
+      formData.append("sampleId", selectedSampleId);
+    }
     formData.append("pipeType", pipeType);
     formData.append("confidence", String(confidence));
     formData.append("iou", String(iou));
     formData.append("imageSize", String(imageSize));
     formData.append("glareFilter", glareFilter ? "true" : "false");
+    formData.append("enableGemini", enableGemini ? "true" : "false");
 
     try {
       const response = await fetch(API_URL, {
@@ -146,10 +154,31 @@ function App() {
         throw new Error(payload.error || "Inference processing failed.");
       }
 
+      // ⚡ Instant Sub-Second Detection Update (< 1s)
       setResult(payload);
+      setLoading(false);
+
+      // ✦ Background Gemini Analysis (Asynchronous worker)
+      if (enableGemini && payload.analysisId) {
+        setGeminiLoading(true);
+        fetch(`/gemini-analysis/${payload.analysisId}`)
+          .then((res) => res.json())
+          .then((data) => {
+            if (data.success && data.geminiAnalysis) {
+              setResult((prev) =>
+                prev ? { ...prev, geminiAnalysis: data.geminiAnalysis } : prev
+              );
+            }
+          })
+          .catch((err) => {
+            console.error("Gemini background fetch failed:", err);
+          })
+          .finally(() => {
+            setGeminiLoading(false);
+          });
+      }
     } catch (requestError) {
       setError(requestError.message);
-    } finally {
       setLoading(false);
     }
   };
@@ -243,6 +272,23 @@ function App() {
               type="checkbox"
               checked={glareFilter}
               onChange={(event) => setGlareFilter(event.target.checked)}
+            />
+          </div>
+        </div>
+
+        <div className="control-group">
+          <div className="toggle-row">
+            <div>
+              <label htmlFor="enableGemini" style={{ marginBottom: 2 }}>Gemini AI Analysis</label>
+              <small style={{ color: "#94a3b8", display: "block", fontSize: "0.74rem" }}>
+                Persistent background worker
+              </small>
+            </div>
+            <input
+              id="enableGemini"
+              type="checkbox"
+              checked={enableGemini}
+              onChange={(event) => setEnableGemini(event.target.checked)}
             />
           </div>
         </div>
@@ -444,9 +490,23 @@ function App() {
               )
             )}
 
-            {result?.geminiAnalysis && result.geminiAnalysis.trim() !== "" && result.geminiAnalysis.toLowerCase() !== "none" && (
+            {geminiLoading && (
+              <div className="gemini-panel loading">
+                <div className="gemini-header">
+                  ✦ Gemini Structural & Glare Analysis
+                  <span className="gemini-badge-worker">Worker Active</span>
+                </div>
+                <div className="gemini-body gemini-pulsing">
+                  Generating multimodal structural reflections & glare reduction notes via background worker...
+                </div>
+              </div>
+            )}
+
+            {!geminiLoading && result?.geminiAnalysis && result.geminiAnalysis.trim() !== "" && result.geminiAnalysis.toLowerCase() !== "none" && (
               <div className="gemini-panel">
-                <div className="gemini-header">Gemini Structural & Glare Analysis</div>
+                <div className="gemini-header">
+                  ✦ Gemini Structural & Glare Analysis
+                </div>
                 <div className="gemini-body">{result.geminiAnalysis}</div>
               </div>
             )}

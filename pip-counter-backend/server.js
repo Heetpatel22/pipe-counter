@@ -4,7 +4,8 @@ const multer = require("multer");
 const ort = require("onnxruntime-node");
 const path = require("path");
 const sharp = require("sharp");
-const { execFile } = require("child_process");
+const { spawn } = require("child_process");
+const readline = require("readline");
 const fs = require("fs");
 
 const app = express();
@@ -34,6 +35,86 @@ const STREAMS = {
 const sessions = {};
 const UI_BUILD_DIR = path.resolve(__dirname, "..", "pipe-counter-ui", "build");
 const SAMPLES_DIR = path.resolve(__dirname, "..", "Sample_images");
+
+// Persistent Gemini Worker Process Management
+let geminiWorker = null;
+let geminiRl = null;
+const geminiCallbacks = new Map();
+let requestIdCounter = 0;
+const pendingAnalyses = new Map();
+
+function startGeminiWorker() {
+  const pythonCmd = process.platform === "win32" ? "python" : "python3";
+  const workerScript = path.resolve(__dirname, "..", "gemini_worker.py");
+
+  console.log("Starting persistent Gemini background worker...");
+  try {
+    geminiWorker = spawn(pythonCmd, [workerScript], {
+      cwd: path.resolve(__dirname, ".."),
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+
+    geminiWorker.stderr.on("data", (data) => {
+      console.log(`[GeminiWorker] ${data.toString().trim()}`);
+    });
+
+    geminiRl = readline.createInterface({
+      input: geminiWorker.stdout,
+    });
+
+    geminiRl.on("line", (line) => {
+      try {
+        const payload = JSON.parse(line.trim());
+        if (payload.status === "ready") {
+          console.log("Persistent Gemini background worker is READY.");
+          return;
+        }
+        if (payload.id && geminiCallbacks.has(payload.id)) {
+          const { resolve } = geminiCallbacks.get(payload.id);
+          geminiCallbacks.delete(payload.id);
+          if (payload.success) {
+            resolve(payload.analysis);
+          } else {
+            resolve(`Gemini analysis unavailable: ${payload.error || "Unknown error"}`);
+          }
+        }
+      } catch (err) {
+        console.error("Error parsing Gemini worker output:", err);
+      }
+    });
+
+    geminiWorker.on("close", (code) => {
+      console.warn(`Gemini worker exited with code ${code}. Restarting worker in 2s...`);
+      geminiWorker = null;
+      geminiRl = null;
+      setTimeout(startGeminiWorker, 2000);
+    });
+  } catch (err) {
+    console.error("Failed to start Gemini worker:", err);
+  }
+}
+
+function requestGeminiAnalysis(imagePath) {
+  return new Promise((resolve) => {
+    if (!geminiWorker || !geminiWorker.stdin.writable) {
+      return resolve("Gemini background worker is not currently active.");
+    }
+    const id = `req_${++requestIdCounter}_${Date.now()}`;
+    geminiCallbacks.set(id, { resolve });
+    geminiWorker.stdin.write(JSON.stringify({ id, imagePath }) + "\n");
+
+    // Timeout fallback after 45s
+    setTimeout(() => {
+      if (geminiCallbacks.has(id)) {
+        geminiCallbacks.delete(id);
+        resolve("Gemini analysis timed out after 45 seconds.");
+      }
+    }, 45000);
+  });
+}
+
+// Start worker immediately on server startup
+startGeminiWorker();
 
 app.use(cors());
 app.use(express.json());
@@ -324,11 +405,19 @@ app.post("/detect", upload.single("image"), async (req, res) => {
     return res.status(503).json({ success: false, error: `${stream.label} model is still loading.` });
   }
 
-  if (!req.file) {
-    return res.status(400).json({ success: false, error: "No image uploaded." });
+  let imageBuffer = null;
+  if (req.file) {
+    imageBuffer = req.file.buffer;
+  } else if (req.body.sampleId) {
+    const samplePath = path.join(SAMPLES_DIR, path.basename(req.body.sampleId));
+    if (fs.existsSync(samplePath)) {
+      imageBuffer = await fs.promises.readFile(samplePath);
+    }
   }
 
-  const tempFilePath = path.join(__dirname, "..", `temp_${Date.now()}.jpg`);
+  if (!imageBuffer) {
+    return res.status(400).json({ success: false, error: "No image uploaded or sample selected." });
+  }
 
   try {
     const confidenceThreshold = clamp(
@@ -340,31 +429,10 @@ app.post("/detect", upload.single("image"), async (req, res) => {
     const imageSize = clamp(Number(req.body.imageSize) || DEFAULT_IMAGE_SIZE, 320, 1280);
     const applyGlareFilter = req.body.glareFilter === "true";
 
-    // Write temp file for the python script
-    await fs.promises.writeFile(tempFilePath, req.file.buffer);
-
-    // Run Gemini process and YOLO preprocessing in parallel
-    const runGemini = new Promise((resolve) => {
-      const pythonCmd = process.platform === "win32" ? "python" : "python3";
-      const scriptPath = path.resolve(__dirname, "..", "gemini_process.py");
-      execFile(pythonCmd, [scriptPath, tempFilePath], (error, stdout, stderr) => {
-        if (error) {
-          console.error(`Gemini process error: ${stderr || error.message}`);
-          resolve("Failed to run Gemini glare-restoration analysis.");
-        } else {
-          resolve(stdout.trim());
-        }
-      });
-    });
-
-    const runYolo = Promise.all([
-      preprocessImage(req.file.buffer, imageSize, applyGlareFilter),
-      getGrayscalePixels(req.file.buffer, applyGlareFilter),
-    ]);
-
-    const [geminiText, [{ tensor, originalWidth, originalHeight }, gray]] = await Promise.all([
-      runGemini,
-      runYolo,
+    // Run YOLO preprocessing and inference immediately (sub-second)
+    const [{ tensor, originalWidth, originalHeight }, gray] = await Promise.all([
+      preprocessImage(imageBuffer, imageSize, applyGlareFilter),
+      getGrayscalePixels(imageBuffer, applyGlareFilter),
     ]);
 
     const outputs = await session.run({ [session.inputNames[0]]: tensor });
@@ -384,27 +452,59 @@ app.post("/detect", upload.single("image"), async (req, res) => {
     const hollowCount = countHollowCenters(gray, boxes);
     const batch = evaluateBatch(pipeType, stream, boxes, avgConfidence, hollowCount);
     const annotatedImage = batch.accepted
-      ? `data:image/jpeg;base64,${(await createAnnotatedImage(req.file.buffer, boxes, stream.ringColor)).toString("base64")}`
+      ? `data:image/jpeg;base64,${(await createAnnotatedImage(imageBuffer, boxes, stream.ringColor)).toString("base64")}`
       : "";
 
+    // Trigger persistent Gemini worker in background if requested
+    let analysisId = null;
+    const requestGemini = req.body.enableGemini === "true";
+    if (requestGemini) {
+      analysisId = `anl_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+      const tempFilePath = path.join(__dirname, "..", `temp_${analysisId}.jpg`);
+
+      const geminiPromise = fs.promises
+        .writeFile(tempFilePath, imageBuffer)
+        .then(() => requestGeminiAnalysis(tempFilePath))
+        .finally(() => {
+          fs.promises.unlink(tempFilePath).catch(() => {});
+        });
+
+      pendingAnalyses.set(analysisId, {
+        promise: geminiPromise,
+        createdAt: Date.now(),
+      });
+
+      // Evict after 10 minutes
+      setTimeout(() => pendingAnalyses.delete(analysisId), 10 * 60 * 1000);
+    }
+
+    // Return immediate response with detection count and bounding rings (< 1 second)
     return res.json({
       success: true,
       pipeType,
       imageMode: applyGlareFilter ? "Normalized" : "Raw image",
-      geminiAnalysis: geminiText,
+      analysisId,
+      geminiPending: Boolean(requestGemini),
       ...batch,
       annotatedImage,
     });
   } catch (error) {
-    console.error(error);
+    console.error("Inference error:", error);
     return res.status(500).json({ success: false, error: "Inference processing failed." });
-  } finally {
-    // Ensure temp file is cleaned up
-    fs.promises.unlink(tempFilePath).catch((err) => {
-      if (err.code !== "ENOENT") {
-        console.error("Temp file cleanup failed:", err);
-      }
-    });
+  }
+});
+
+app.get("/gemini-analysis/:id", async (req, res) => {
+  const { id } = req.params;
+  const entry = pendingAnalyses.get(id);
+  if (!entry) {
+    return res.status(404).json({ success: false, error: "Analysis ID not found or expired." });
+  }
+  try {
+    const analysisText = await entry.promise;
+    return res.json({ success: true, geminiAnalysis: analysisText });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: err.message });
   }
 });
 

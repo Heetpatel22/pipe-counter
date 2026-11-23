@@ -399,6 +399,33 @@ h1 {
   white-space: pre-wrap;
 }
 
+.gemini-panel.loading {
+  background: linear-gradient(135deg, rgba(20, 184, 166, 0.08) 0%, rgba(20, 184, 166, 0.02) 100%);
+  border-style: dashed;
+}
+
+.gemini-badge-worker {
+  margin-left: auto;
+  font-size: 0.68rem;
+  background: #ccfbf1;
+  color: #0f766e;
+  border-radius: 999px;
+  padding: 2px 8px;
+  font-weight: 700;
+  text-transform: none;
+}
+
+.gemini-pulsing {
+  color: #0d9488;
+  font-style: italic;
+  animation: geminiPulse 1.8s infinite ease-in-out;
+}
+
+@keyframes geminiPulse {
+  0%, 100% { opacity: 0.6; }
+  50% { opacity: 1; }
+}
+
 /* Source Selection Tabs */
 .source-tabs {
   display: flex;
