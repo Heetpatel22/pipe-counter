@@ -75,3 +75,4 @@ The application is pre-configured to run behind a Cloudflare Tunnel:
 cloudflared.exe tunnel run --token <YOUR_TUNNEL_TOKEN>
 ```
 Route the tunnel ingress to `http://localhost:5005` to serve both the static UI and the `/detect` API under a unified hostname without CORS restrictions.
+
